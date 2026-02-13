@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock Procedure Analyzer</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Stock Procedure Analyzer</h1>
+    <p>Enter a ticker to run the full filing-first workflow.</p>
+    <form id="ticker-form">
+      <input id="ticker" placeholder="AAPL" required />
+      <button type="submit">Analyze</button>
+    </form>
+
+    <section id="status"></section>
+    <section id="chart" class="card"></section>
+    <section id="output" class="card"></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
