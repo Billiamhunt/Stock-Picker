@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
@@ -22,25 +24,28 @@ DEFAULT_TAX_RATE = 0.21
 def safe_div(n: float | None, d: float | None) -> float | None:
     if n is None or d is None or d == 0:
         return None
-    return n / d
+    try:
+        return n / d
+    except Exception:
+        return None
 
 
-def nm_ratio(n: float | None, d: float | None, require_positive_denominator: bool = False) -> float | str:
-    if n is None or d is None or d == 0:
+def nm(value: float | None) -> str | float:
+    if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
         return "N/M"
-    if require_positive_denominator and d <= 0:
-        return "N/M"
-    out = safe_div(n, d)
-    if out is None:
-        return "N/M"
-    return out
+    return value
 
 
-def nm_percent(n: float | None, d: float | None) -> str:
-    value = safe_div(n, d)
+def pct(value: float | None) -> str:
     if value is None:
         return "N/M"
     return f"{value * 100:.2f}%"
+
+
+def num(value: float | None) -> str:
+    if value is None:
+        return "N/M"
+    return f"{value:,.2f}"
 
 
 def get_sec_headers() -> dict[str, str]:
@@ -65,25 +70,26 @@ def get_sec_filings(ticker: str) -> dict[str, Any]:
     subm.raise_for_status()
     data = subm.json()
     recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    accession = recent.get("accessionNumber", [])
+    primary_doc = recent.get("primaryDocument", [])
+    filing_date = recent.get("filingDate", [])
 
     latest_10k = None
     latest_10q = None
-    forms = recent.get("form", [])
-    accessions = recent.get("accessionNumber", [])
-    docs = recent.get("primaryDocument", [])
-    dates = recent.get("filingDate", [])
-
     for i, form in enumerate(forms):
-        if form in {"10-K", "10-Q"}:
-            acc = accessions[i].replace("-", "")
-            payload = {
-                "filing_date": dates[i],
-                "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{docs[i]}",
+        if form == "10-K" and latest_10k is None:
+            acc = accession[i].replace("-", "")
+            latest_10k = {
+                "filing_date": filing_date[i],
+                "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{primary_doc[i]}",
             }
-            if form == "10-K" and latest_10k is None:
-                latest_10k = payload
-            if form == "10-Q" and latest_10q is None:
-                latest_10q = payload
+        if form == "10-Q" and latest_10q is None:
+            acc = accession[i].replace("-", "")
+            latest_10q = {
+                "filing_date": filing_date[i],
+                "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{primary_doc[i]}",
+            }
         if latest_10k and latest_10q:
             break
 
@@ -93,6 +99,17 @@ def get_sec_filings(ticker: str) -> dict[str, Any]:
         "latest_10q": latest_10q,
         "fiscal_year_end": data.get("fiscalYearEnd"),
     }
+
+
+def frame_to_dict(df: pd.DataFrame | None) -> dict[str, dict[str, float]]:
+    if df is None or df.empty:
+        return {}
+    clean = df.T.sort_index()
+    out = {}
+    for idx, row in clean.iterrows():
+        key = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+        out[key] = {k: float(v) if pd.notna(v) else np.nan for k, v in row.to_dict().items()}
+    return out
 
 
 def get_statement_line(df: pd.DataFrame | None, candidates: list[str], col: Any) -> float | None:
@@ -105,46 +122,6 @@ def get_statement_line(df: pd.DataFrame | None, candidates: list[str], col: Any)
     return None
 
 
-def ttm_sum(df: pd.DataFrame | None, keys: list[str]) -> float | None:
-    if df is None or df.empty or len(df.columns) < 4:
-        return None
-    vals: list[float] = []
-    for col in list(df.columns[:4]):
-        v = get_statement_line(df, keys, col)
-        if v is None:
-            return None
-        vals.append(v)
-    return float(sum(vals))
-
-
-def get_risk_free_rate() -> float | None:
-    # ^TNX is 10Y Treasury yield * 10, so divide by 100 for decimal
-    tnx = yf.Ticker("^TNX").history(period="5d", interval="1d")
-    if tnx.empty:
-        return None
-    return float(tnx["Close"].iloc[-1]) / 100.0
-
-
-def get_beta_5y_monthly(ticker: str) -> float | None:
-    stock = yf.Ticker(ticker).history(period="5y", interval="1mo")
-    market = yf.Ticker("^GSPC").history(period="5y", interval="1mo")
-    if stock.empty or market.empty:
-        return None
-
-    s = stock["Close"].pct_change().dropna()
-    m = market["Close"].pct_change().dropna()
-    joined = pd.concat([s, m], axis=1, join="inner").dropna()
-    if joined.empty:
-        return None
-
-    joined.columns = ["s", "m"]
-    var_m = joined["m"].var()
-    if var_m == 0:
-        return None
-    cov = joined["s"].cov(joined["m"])
-    return float(cov / var_m)
-
-
 def build_response(ticker: str) -> dict[str, Any]:
     tk = yf.Ticker(ticker)
     info = tk.info or {}
@@ -152,209 +129,194 @@ def build_response(ticker: str) -> dict[str, Any]:
     if hist.empty:
         raise ValueError("Ticker history unavailable")
 
-    sec = get_sec_filings(ticker)
-
     income = tk.income_stmt
     balance = tk.balance_sheet
     cashflow = tk.cashflow
     q_income = tk.quarterly_income_stmt
     q_cashflow = tk.quarterly_cashflow
 
-    price = float(hist.iloc[-1]["Close"])
+    sec = get_sec_filings(ticker)
+
+    market_price = float(hist.iloc[-1]["Close"])
     market_cap = info.get("marketCap")
     shares = info.get("sharesOutstanding") or info.get("impliedSharesOutstanding")
+    beta = info.get("beta")
+    pe = info.get("trailingPE")
+    pb = info.get("priceToBook")
+    ps = info.get("priceToSalesTrailing12Months")
+    peg = info.get("pegRatio")
 
     latest_col = income.columns[0] if not income.empty else None
     prev_col = income.columns[1] if income.shape[1] > 1 else None
-    bs_col = balance.columns[0] if not balance.empty else None
-    bs_prev = balance.columns[1] if balance.shape[1] > 1 else None
-    cf_col = cashflow.columns[0] if not cashflow.empty else None
 
     rev = get_statement_line(income, ["Total Revenue"], latest_col)
     cogs = get_statement_line(income, ["Cost Of Revenue"], latest_col)
     gross = get_statement_line(income, ["Gross Profit"], latest_col)
     sga = get_statement_line(income, ["Selling General And Administration"], latest_col)
     rnd = get_statement_line(income, ["Research And Development"], latest_col)
+    da = get_statement_line(cashflow, ["Depreciation And Amortization", "Depreciation"], cashflow.columns[0] if not cashflow.empty else None)
     ebit = get_statement_line(income, ["Operating Income", "EBIT"], latest_col)
-    da = get_statement_line(cashflow, ["Depreciation And Amortization", "Depreciation"], cf_col)
     interest = get_statement_line(income, ["Interest Expense", "Interest Expense Non Operating"], latest_col)
     taxes = get_statement_line(income, ["Tax Provision"], latest_col)
     net_income = get_statement_line(income, ["Net Income"], latest_col)
 
-    cash = get_statement_line(balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"], bs_col)
-    ar = get_statement_line(balance, ["Accounts Receivable"], bs_col)
-    inventory = get_statement_line(balance, ["Inventory"], bs_col)
-    other_ca = get_statement_line(balance, ["Other Current Assets"], bs_col)
-    current_assets = get_statement_line(balance, ["Current Assets"], bs_col)
-    current_liab = get_statement_line(balance, ["Current Liabilities"], bs_col)
-    ap = get_statement_line(balance, ["Accounts Payable"], bs_col)
-    accrued = get_statement_line(balance, ["Accrued Expenses"], bs_col)
-    deferred = get_statement_line(balance, ["Deferred Revenue"], bs_col)
-    current_debt = get_statement_line(balance, ["Current Debt", "Current Debt And Capital Lease Obligation"], bs_col)
-    ltd = get_statement_line(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"], bs_col)
-    lease = get_statement_line(balance, ["Operating Lease Liability", "Long Term Lease Liability"], bs_col)
-    total_assets = get_statement_line(balance, ["Total Assets"], bs_col)
-    equity = get_statement_line(balance, ["Stockholders Equity", "Total Equity Gross Minority Interest"], bs_col)
+    cash = get_statement_line(balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"], balance.columns[0] if not balance.empty else None)
+    ar = get_statement_line(balance, ["Accounts Receivable"], balance.columns[0] if not balance.empty else None)
+    inventory = get_statement_line(balance, ["Inventory"], balance.columns[0] if not balance.empty else None)
+    other_ca = get_statement_line(balance, ["Other Current Assets"], balance.columns[0] if not balance.empty else None)
+    current_liab = get_statement_line(balance, ["Current Liabilities"], balance.columns[0] if not balance.empty else None)
+    ap = get_statement_line(balance, ["Accounts Payable"], balance.columns[0] if not balance.empty else None)
+    accrued = get_statement_line(balance, ["Accrued Expenses"], balance.columns[0] if not balance.empty else None)
+    deferred = get_statement_line(balance, ["Deferred Revenue"], balance.columns[0] if not balance.empty else None)
+    current_debt = get_statement_line(balance, ["Current Debt", "Current Debt And Capital Lease Obligation"], balance.columns[0] if not balance.empty else None)
+    ltd = get_statement_line(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"], balance.columns[0] if not balance.empty else None)
+    lease = get_statement_line(balance, ["Operating Lease Liability", "Long Term Lease Liability"], balance.columns[0] if not balance.empty else None)
+    total_assets = get_statement_line(balance, ["Total Assets"], balance.columns[0] if not balance.empty else None)
+    equity = get_statement_line(balance, ["Stockholders Equity", "Total Equity Gross Minority Interest"], balance.columns[0] if not balance.empty else None)
+    current_assets = get_statement_line(balance, ["Current Assets"], balance.columns[0] if not balance.empty else None)
 
-    cfo = get_statement_line(cashflow, ["Operating Cash Flow"], cf_col)
-    capex_raw = get_statement_line(cashflow, ["Capital Expenditure"], cf_col)
-    capex = abs(capex_raw) if capex_raw is not None else None
+    cfo = get_statement_line(cashflow, ["Operating Cash Flow"], cashflow.columns[0] if not cashflow.empty else None)
+    capex = get_statement_line(cashflow, ["Capital Expenditure"], cashflow.columns[0] if not cashflow.empty else None)
+    if capex is not None:
+        capex = abs(capex)
     fcf = cfo - capex if cfo is not None and capex is not None else None
 
-    rev_ttm = ttm_sum(q_income, ["Total Revenue"])
-    ni_ttm = ttm_sum(q_income, ["Net Income"])
-    cfo_ttm = ttm_sum(q_cashflow, ["Operating Cash Flow"])
-    capex_ttm_raw = ttm_sum(q_cashflow, ["Capital Expenditure"])
-    capex_ttm = abs(capex_ttm_raw) if capex_ttm_raw is not None else None
+    def ttm(df: pd.DataFrame | None, keys: list[str]) -> float | None:
+        if df is None or df.empty:
+            return None
+        cols = list(df.columns[:4])
+        vals = []
+        for col in cols:
+            v = get_statement_line(df, keys, col)
+            if v is None:
+                return None
+            vals.append(v)
+        return float(sum(vals))
+
+    rev_ttm = ttm(q_income, ["Total Revenue"])
+    ni_ttm = ttm(q_income, ["Net Income"])
+    cfo_ttm = ttm(q_cashflow, ["Operating Cash Flow"])
+    capex_ttm = ttm(q_cashflow, ["Capital Expenditure"])
+    if capex_ttm is not None:
+        capex_ttm = abs(capex_ttm)
     fcf_ttm = cfo_ttm - capex_ttm if cfo_ttm is not None and capex_ttm is not None else fcf
 
-    debt_total = (current_debt or 0.0) + (ltd or 0.0)
-    debt_prev = (
-        (get_statement_line(balance, ["Current Debt", "Current Debt And Capital Lease Obligation"], bs_prev) or 0.0)
-        + (get_statement_line(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"], bs_prev) or 0.0)
-    )
-    avg_debt = (debt_total + debt_prev) / 2 if (debt_total or debt_prev) else None
+    ebitda_ttm = (ebit if ebit is not None else 0) + (da if da is not None else 0)
+    debt_total = (current_debt or 0) + (ltd or 0)
+    enterprise_value = (market_cap or 0) + debt_total - (cash or 0)
 
-    ebitda_ttm = (ebit or 0.0) + (da or 0.0)
-    enterprise_value = (market_cap or 0.0) + debt_total - (cash or 0.0)
     nopat = ebit * (1 - DEFAULT_TAX_RATE) if ebit is not None else None
-
-    pe = nm_ratio(price, safe_div(ni_ttm, shares), require_positive_denominator=True)
-    pb = nm_ratio(price, safe_div(equity, shares), require_positive_denominator=True)
-    ps = nm_ratio(price, safe_div(rev_ttm, shares), require_positive_denominator=True)
-    eps_growth = None
-    if latest_col is not None and prev_col is not None:
-        ni_prev = get_statement_line(income, ["Net Income"], prev_col)
-        if ni_prev not in (None, 0):
-            eps_growth = (net_income - ni_prev) / abs(ni_prev) if net_income is not None else None
-    peg = "N/M"
-    if isinstance(pe, float) and eps_growth not in (None, 0):
-        peg = pe / (eps_growth * 100)
 
     metrics = {
         "valuation": {
-            "P/E (TTM)": pe,
-            "P/B (FY)": pb,
-            "P/S (TTM)": ps,
-            "PEG": peg if isinstance(peg, float) else "N/M",
-            "EV/EBITDA (TTM)": nm_ratio(enterprise_value, ebitda_ttm, require_positive_denominator=True),
-            "EV/EBIT (TTM proxy)": nm_ratio(enterprise_value, ebit, require_positive_denominator=True),
-            "EV/NOPAT (TTM proxy)": nm_ratio(enterprise_value, nopat, require_positive_denominator=True),
-            "Price / Cash Flow (TTM)": nm_ratio(price, safe_div(cfo_ttm, shares), require_positive_denominator=True),
+            "P/E": nm(pe),
+            "P/B (FY)": nm(pb),
+            "P/S": nm(ps),
+            "PEG": nm(peg),
+            "EV/EBITDA": nm(safe_div(enterprise_value, ebitda_ttm if ebitda_ttm else None)),
+            "EV/EBIT": nm(safe_div(enterprise_value, ebit)),
+            "EV/NOPAT": nm(safe_div(enterprise_value, nopat)),
+            "Price / Cash Flow": nm(safe_div(market_cap, cfo_ttm)),
         },
         "profitability": {
-            "Gross margin (FY)": nm_percent(gross, rev),
-            "Operating margin (FY)": nm_percent(ebit, rev),
-            "Net margin (FY)": nm_percent(net_income, rev),
-            "ROE (FY)": nm_percent(net_income, equity),
-            "ROA (FY)": nm_percent(net_income, total_assets),
-            "ROIC (FY)": nm_percent(nopat, (equity or 0.0) + debt_total - (cash or 0.0)),
+            "Gross margin (FY)": pct(safe_div(gross, rev)),
+            "Operating margin (FY)": pct(safe_div(ebit, rev)),
+            "Net margin (FY)": pct(safe_div(net_income, rev)),
+            "ROE (FY)": pct(safe_div(net_income, equity)),
+            "ROA (FY)": pct(safe_div(net_income, total_assets)),
+            "ROIC (FY)": pct(safe_div(nopat, (equity or 0) + debt_total - (cash or 0))),
         },
         "leverage": {
-            "Debt / Equity (FY)": nm_ratio(debt_total, equity, require_positive_denominator=True),
-            "Debt / EBITDA (TTM proxy)": nm_ratio(debt_total, ebitda_ttm, require_positive_denominator=True),
-            "Interest coverage (EBIT/Interest)": nm_ratio(ebit, abs(interest) if interest else None, require_positive_denominator=True),
+            "Debt / Equity (FY)": nm(safe_div(debt_total, equity)),
+            "Debt / EBITDA (TTM)": nm(safe_div(debt_total, ebitda_ttm)),
+            "Interest coverage (EBIT/Interest)": nm(safe_div(ebit, abs(interest) if interest else None)),
         },
         "liquidity_efficiency": {
-            "Current ratio (FY)": nm_ratio(current_assets, current_liab, require_positive_denominator=True),
-            "Quick ratio (FY)": nm_ratio((cash or 0.0) + (ar or 0.0), current_liab, require_positive_denominator=True),
-            "Asset turnover (FY)": nm_ratio(rev, total_assets, require_positive_denominator=True),
-            "Inventory turnover (FY)": nm_ratio(cogs, inventory, require_positive_denominator=True),
-            "Receivables turnover (FY)": nm_ratio(rev, ar, require_positive_denominator=True),
+            "Current ratio (FY)": nm(safe_div(current_assets, current_liab)),
+            "Quick ratio (FY)": nm(safe_div((cash or 0) + (ar or 0), current_liab)),
+            "Asset turnover (FY)": nm(safe_div(rev, total_assets)),
+            "Inventory turnover (FY)": nm(safe_div(cogs, inventory)),
+            "Receivables turnover (FY)": nm(safe_div(rev, ar)),
         },
         "free_cash_flow": {
-            "FCF (TTM)": fcf_ttm if fcf_ttm is not None else "N/M",
-            "FCF yield (TTM)": nm_percent(fcf_ttm, market_cap),
-            "FCF margin (TTM)": nm_percent(fcf_ttm, rev_ttm),
+            "FCF (TTM)": nm(fcf_ttm),
+            "FCF yield": pct(safe_div(fcf_ttm, market_cap)),
+            "FCF margin": pct(safe_div(fcf_ttm, rev_ttm if rev_ttm else rev)),
         },
     }
 
-    risk_free = get_risk_free_rate()
-    beta_5y = get_beta_5y_monthly(ticker)
-    cost_of_equity = (risk_free + beta_5y * DEFAULT_ERP) if risk_free is not None and beta_5y is not None else None
-    cost_of_debt = safe_div(abs(interest) if interest is not None else None, avg_debt)
+    risk_free = (info.get("tenYearAverageReturn") or 0.043)
+    cost_of_equity = risk_free + (beta or 1.0) * DEFAULT_ERP
+    avg_debt = debt_total
+    cost_of_debt = safe_div(abs(interest) if interest else None, avg_debt)
+    net_debt = debt_total - (cash or 0)
+    e_weight = safe_div(market_cap, (market_cap or 0) + max(net_debt, 0)) or 1
+    d_weight = 1 - e_weight
+    wacc = (e_weight * cost_of_equity) + (d_weight * (cost_of_debt or 0.05) * (1 - DEFAULT_TAX_RATE))
 
-    net_debt = debt_total - (cash or 0.0)
-    cap_base = (market_cap or 0.0) + max(net_debt, 0.0)
-    e_weight = safe_div(market_cap, cap_base) if cap_base else None
-    d_weight = (1 - e_weight) if e_weight is not None else None
-
-    wacc = None
-    if cost_of_equity is not None and e_weight is not None and d_weight is not None:
-        rd = cost_of_debt if cost_of_debt is not None else 0.05
-        wacc = (e_weight * cost_of_equity) + (d_weight * rd * (1 - DEFAULT_TAX_RATE))
-
-    dcf = None
     base_fcf = fcf_ttm
-    if base_fcf is not None and wacc is not None and wacc > DEFAULT_TERMINAL_GROWTH and shares:
-        growth = 0.04
-        fcfs = [base_fcf * ((1 + growth) ** yr) for yr in range(1, 6)]
+    dcf = None
+    if base_fcf and wacc and wacc > DEFAULT_TERMINAL_GROWTH:
+        growth = 0.05
+        fcfs = [base_fcf * ((1 + growth) ** i) for i in range(1, 6)]
         pv_fcfs = [fcf_i / ((1 + wacc) ** i) for i, fcf_i in enumerate(fcfs, 1)]
         terminal = (fcfs[-1] * (1 + DEFAULT_TERMINAL_GROWTH)) / (wacc - DEFAULT_TERMINAL_GROWTH)
-        ev = sum(pv_fcfs) + terminal / ((1 + wacc) ** 5)
-        eq = ev - net_debt
-        intrinsic = safe_div(eq, shares)
-
-        sensitivity: list[dict[str, Any]] = []
-        for w in [wacc - 0.01, wacc + 0.01]:
-            row_vals: list[float | None] = []
-            for g in [DEFAULT_TERMINAL_GROWTH - 0.01, DEFAULT_TERMINAL_GROWTH, DEFAULT_TERMINAL_GROWTH + 0.01]:
-                if w <= g:
-                    row_vals.append(None)
-                    continue
-                terminal_s = (fcfs[-1] * (1 + g)) / (w - g)
-                ev_s = sum([f / ((1 + w) ** i) for i, f in enumerate(fcfs, 1)]) + terminal_s / ((1 + w) ** 5)
-                row_vals.append(safe_div(ev_s - net_debt, shares))
-            sensitivity.append({"wacc": w, "values": row_vals})
+        pv_terminal = terminal / ((1 + wacc) ** 5)
+        ev = sum(pv_fcfs) + pv_terminal
+        eq_val = ev - net_debt
+        iv = safe_div(eq_val, shares)
 
         dcf = {
             "base_fcf_ttm": base_fcf,
             "growth_assumption": growth,
             "terminal_growth": DEFAULT_TERMINAL_GROWTH,
             "enterprise_value": ev,
-            "equity_value": eq,
-            "intrinsic_value_per_share": intrinsic,
-            "sensitivity_2x3": sensitivity,
+            "equity_value": eq_val,
+            "intrinsic_value_per_share": iv,
+            "sensitivity": [],
         }
+        for w in [wacc - 0.01, wacc, wacc + 0.01]:
+            row = {"wacc": w, "values": []}
+            for g in [0.01, DEFAULT_TERMINAL_GROWTH, 0.03]:
+                if w <= g:
+                    row["values"].append(None)
+                    continue
+                t = (fcfs[-1] * (1 + g)) / (w - g)
+                ev_s = sum([f / ((1 + w) ** i) for i, f in enumerate(fcfs, 1)]) + t / ((1 + w) ** 5)
+                eq_s = ev_s - net_debt
+                row["values"].append(safe_div(eq_s, shares))
+            dcf["sensitivity"].append(row)
 
-    hist_5y: list[dict[str, Any]] = []
-    for col in list(income.columns[:5]):
-        yr = col.year if hasattr(col, "year") else str(col)
-        yr_rev = get_statement_line(income, ["Total Revenue"], col)
-        yr_gp = get_statement_line(income, ["Gross Profit"], col)
-        yr_ebit = get_statement_line(income, ["Operating Income", "EBIT"], col)
-        yr_ni = get_statement_line(income, ["Net Income"], col)
-        yr_cfo = get_statement_line(cashflow, ["Operating Cash Flow"], col)
-        yr_capex = get_statement_line(cashflow, ["Capital Expenditure"], col)
-        yr_da = get_statement_line(cashflow, ["Depreciation And Amortization", "Depreciation"], col)
-        hist_5y.append(
-            {
-                "FY": str(yr),
-                "Revenue": yr_rev,
-                "Gross margin": safe_div(yr_gp, yr_rev),
-                "Operating margin": safe_div(yr_ebit, yr_rev),
-                "Net margin": safe_div(yr_ni, yr_rev),
-                "EBITDA": (yr_ebit or 0.0) + (yr_da or 0.0),
-                "FCF": (yr_cfo - abs(yr_capex)) if yr_cfo is not None and yr_capex is not None else None,
-                "Cash": get_statement_line(balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"], col),
-                "Debt": (
-                    (get_statement_line(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"], col) or 0.0)
-                    + (get_statement_line(balance, ["Current Debt", "Current Debt And Capital Lease Obligation"], col) or 0.0)
-                ),
-                "Current ratio": safe_div(
-                    get_statement_line(balance, ["Current Assets"], col),
-                    get_statement_line(balance, ["Current Liabilities"], col),
-                ),
-            }
-        )
+    hist_5y = []
+    for col in income.columns[:5]:
+        year = col.year if hasattr(col, "year") else str(col)
+        year_rev = get_statement_line(income, ["Total Revenue"], col)
+        year_gm = safe_div(get_statement_line(income, ["Gross Profit"], col), year_rev)
+        year_om = safe_div(get_statement_line(income, ["Operating Income", "EBIT"], col), year_rev)
+        year_nm = safe_div(get_statement_line(income, ["Net Income"], col), year_rev)
+        cfo_y = get_statement_line(cashflow, ["Operating Cash Flow"], col)
+        capex_y = get_statement_line(cashflow, ["Capital Expenditure"], col)
+        fcf_y = cfo_y - abs(capex_y) if cfo_y is not None and capex_y is not None else None
+        hist_5y.append({
+            "year": str(year),
+            "Revenue": year_rev,
+            "Gross margin": year_gm,
+            "Operating margin": year_om,
+            "Net margin": year_nm,
+            "EBITDA": (get_statement_line(income, ["Operating Income", "EBIT"], col) or 0) + (get_statement_line(cashflow, ["Depreciation And Amortization", "Depreciation"], col) or 0),
+            "FCF": fcf_y,
+            "Cash": get_statement_line(balance, ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"], col),
+            "Debt": (get_statement_line(balance, ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"], col) or 0) + (get_statement_line(balance, ["Current Debt", "Current Debt And Capital Lease Obligation"], col) or 0),
+            "Current ratio": safe_div(get_statement_line(balance, ["Current Assets"], col), get_statement_line(balance, ["Current Liabilities"], col)),
+        })
 
-    upside = safe_div((dcf["intrinsic_value_per_share"] - price), price) if dcf and dcf.get("intrinsic_value_per_share") is not None else None
+    upside = safe_div((dcf or {}).get("intrinsic_value_per_share", None) - market_price if dcf else None, market_price)
 
     return {
         "ticker": ticker.upper(),
         "as_of": datetime.utcnow().isoformat() + "Z",
         "price_snapshot": {
-            "current_price": price,
+            "current_price": market_price,
             "market_cap": market_cap,
             "fiscal_year_end": sec.get("fiscal_year_end"),
             "latest_10k": sec.get("latest_10k"),
@@ -408,7 +370,7 @@ def build_response(ticker: str) -> dict[str, Any]:
             "risk_free_rate_10y": risk_free,
             "equity_risk_premium_kroll": DEFAULT_ERP,
             "kroll_source": KROLL_ERP_SOURCE,
-            "beta_5y_monthly": beta_5y,
+            "beta_5y_monthly": beta,
             "cost_of_equity_capm": cost_of_equity,
             "cost_of_debt": cost_of_debt,
             "tax_rate": DEFAULT_TAX_RATE,
@@ -424,14 +386,14 @@ def build_response(ticker: str) -> dict[str, Any]:
             "close": [float(v) for v in hist["Close"]],
         },
         "assumptions": [
-            "Baseline uses latest FY plus prior FY, with TTM for valuation/DCF inputs.",
-            "Tax rate fixed at 21% unless company-specific rate is available.",
-            "Terminal growth base case is 2% for U.S. issuers.",
-            "N/M means non-meaningful (missing or invalid denominator/sign).",
+            "Baseline uses the latest two fiscal years plus TTM where needed.",
+            "Tax rate default 21% unless unavailable company-specific effective rate.",
+            "Terminal growth default 2% for US issuer.",
+            "N/M indicates non-meaningful or unavailable metric.",
         ],
         "sources": [
             "SEC EDGAR submissions API",
-            "Yahoo Finance price history and statements",
+            "Yahoo Finance market and financial statement endpoints",
             "Kroll Cost of Capital Navigator",
         ],
     }
@@ -443,13 +405,14 @@ def index() -> str:
 
 
 @app.route("/api/analyze", methods=["POST"])
-def analyze() -> Any:
+def analyze():
     body = request.get_json(force=True)
     ticker = (body.get("ticker") or "").strip().upper()
     if not ticker:
         return jsonify({"error": "Ticker is required"}), 400
     try:
-        return jsonify(build_response(ticker))
+        data = build_response(ticker)
+        return jsonify(data)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
