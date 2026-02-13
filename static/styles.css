@@ -1,0 +1,10 @@
+body { font-family: Arial, sans-serif; background:#f4f6f8; margin:0; }
+main { max-width: 1080px; margin: 2rem auto; padding: 0 1rem; }
+form { display:flex; gap:.5rem; margin-bottom:1rem; }
+input { padding:.6rem; width:220px; }
+button { padding:.6rem 1rem; background:#0d6efd; color:#fff; border:0; cursor:pointer; }
+.card { background:#fff; border-radius:8px; padding:1rem; margin:1rem 0; box-shadow:0 1px 3px rgba(0,0,0,.1); }
+.table { width:100%; border-collapse: collapse; margin:.5rem 0 1rem; font-size:.9rem; }
+.table th,.table td { border:1px solid #ddd; padding:.4rem; }
+.table th { background:#f1f3f5; text-align:left; }
+.small { color:#666; font-size:.85rem; }
